@@ -24,7 +24,8 @@ def csv_converter(file_name: str, fd: BufferedReader|BufferedIOBase):
     ws = wb.create_sheet(splitext(file_name)[0])
 
     for row in csv_reader(fd):
-        ws.append(row)
+        line = [cell.replace('\t', '') if isinstance(cell, str) else cell for cell in row]
+        ws.append(line)
 
     return wb
 
@@ -37,7 +38,11 @@ def read_table_file(name: str, meta: dict, confs: dict, file_name: str, fd: Buff
         wb = csv_converter(file_name, fd)
         assert wb
     elif file_name.endswith('.xls'):
-        wb = XLS2XLSX(fd).to_xlsx()
+        try:
+            wb = XLS2XLSX(fd).to_xlsx()
+        except ValueError as e:
+            if len(e.args) > 0 and e.args[0].__class__.__name__ == 'XLRDError':
+                wb = load_workbook(fd)
     else:
         raise Exception(f"{file_name} 既不是 .xlsx/.csv 文件，也不是旧版本 .xls 文件，不能读取。")
 
@@ -62,37 +67,46 @@ def post_masquerade(meta: dict, sources: dict) -> dict:
         vs = post_proc[VALUESET]
 
         fn = load_plugin(plugin_name)
+        arguments = None
         if ARGUMENT in post_proc:
             arguments = post_proc[ARGUMENT]
             assert arguments, f"完成组装 {plugin_name} 插件不能使用参数 '{str(arguments)}'"
-            values = fn((zip(ds, ls) for ls in zip(*(sources.pop(k) for k in ds))), arguments)
-        else:
-            values = fn((zip(ds, ls) for ls in zip(*(sources.pop(k) for k in ds))))
+        values = fn((zip(ds, ls) for ls in zip(*(sources.pop(k) for k in ds))), arguments)
 
         sources.update(dict(zip(vs, zip(*(v for v in values)))))
 
     return sources
 
 
-def prune_extra_length(data_set: dict):
-    min_len = 0
+def prune_extra_length(data_set: dict) -> tuple:
+    min_len, max_len = None, 0
     try:
         for d_key, d_lst in data_set.items():
-            d_lst = list(d_lst)
+            d_lst = tuple(d_lst)
             d_len = len(d_lst)
-            if min_len == 0 or d_len < min_len:
+
+            if min_len is None or d_len < min_len:
                 min_len = d_len
+
+            if d_len > max_len:
+                max_len = d_len
+
             data_set[d_key] = d_lst
-            print(f"'{d_key}'列载入数据 {min_len} 行 {"" if d_len > min_len else f", 丢弃数据 {d_len - min_len} 行"}。")
+            print(f"'{d_key}'列载入数据 {min_len} 行 {f", 丢弃数据 {d_len - min_len} 行" if d_len > min_len else ""}。")
+        else:
+            if min_len is None:
+                min_len = 0
+
         for d_key, d_lst in data_set.items():
             data_set[d_key] = d_lst[:min_len]
+
+        return min_len, max_len - min_len
     except ValueError:
         assert False, "获取到的数据异常，这通常表示与位置有关的配置项错误。"
 
 
 
 def assemble_data_pack(result: list[dict], data: dict, value_set: list[str]|tuple[str]):
-    prune_extra_length(data)
 
     data_set = dict()
     for key in value_set:
@@ -116,18 +130,19 @@ def is_csv_file(file_name: str) -> bool:
 def is_zip_file(file_path: str) -> bool:
     return is_zip(file_path)
 
-def xls_in_zip(ar: ZipFile):
-    for member_name in ar.namelist():
-        arp = Path(ar, member_name)
-        if arp.is_dir():
-            continue
+def xls_in_zip(ar_path:str):
+    with ZipFile(ar_path) as ar:
+        for member_name in ar.namelist():
+            arp = Path(ar, member_name)
+            if arp.is_dir():
+                continue
 
-        file_name = basename(member_name)
-        if file_name.startswith(r'.') or (file_name.startswith(r'__') and file_name.endswith(r'__')):
-            continue
+            file_name = basename(member_name)
+            if file_name.startswith(r'.') or (file_name.startswith(r'__') and file_name.endswith(r'__')):
+                continue
 
-        with ar.open(member_name, 'r') as fd:
-            yield fd, file_name
+            with ar.open(member_name, 'r') as fd:
+                yield fd, f"{basename(ar_path)}/{member_name}"
 
 
 def xls_in_dir(xl_dir: str):
@@ -141,12 +156,11 @@ def xls_in_dir(xl_dir: str):
             if is_xl_file(file_name):
                 with open(file_path, 'rb') as fd:
                     yield fd, file_name
-            if is_csv_file(file_path):
+            elif is_csv_file(file_path):
                 with open(file_path, 'rt') as fd:
                     yield fd, file_name
-        elif isfile(file_path) and is_zip_file(file_path):
-            with ZipFile(file_path) as ar:
-                yield from xls_in_zip(ar)
+            elif is_zip_file(file_path):
+                yield from xls_in_zip(file_path)
 
         elif isdir(file_path):
             yield from xls_in_dir(file_path)
@@ -157,6 +171,10 @@ def xls_in_dir(xl_dir: str):
 
 
 def main(source: str='xls', out: str='xls', conf: str=''):
+    inc_files = list()
+    exc_files = list()
+    success = False
+
     try:
         delivered_data_packs: list[dict] = list()
         root_dir = getcwd()
@@ -175,7 +193,7 @@ def main(source: str='xls', out: str='xls', conf: str=''):
         print("配置文件加载完成。")
 
         for xl_filed, xl_name in xls_in_dir(f"{root_dir}\\{source}"):
-            print(f"开始处理工作簿：{xl_name}")
+            print(f"  ==: 开始处理工作簿：{xl_name} :==  ")
 
             for (abb_name, acc_des) in acc_conf.items():
                 if not match(abb_name, xl_name):
@@ -195,22 +213,29 @@ def main(source: str='xls', out: str='xls', conf: str=''):
                 pol_meta = get_meta(policy)
                 collection = run_policy(policy, bundle, policy_name, abb_name)
 
-                pack = post_masquerade(pol_meta, collection)
-                assemble_data_pack(delivered_data_packs, pack, v_set)
+                record_cnt, prune_cnt = prune_extra_length(collection)
+                if record_cnt > 0:
+                    pack = post_masquerade(pol_meta, collection)
+                    assemble_data_pack(delivered_data_packs, pack, v_set)
 
-                print(f"  ==: {xl_name} 处理完成！")
+                inc_files.append((xl_name, record_cnt, prune_cnt))
+                print(f"  ==: {xl_name} 处理完成！ :==  \n")
                 break
             else:
-                print(f"  ==: 没有为 {xl_name} 配置描述项，已忽略！")
+                exc_files.append(xl_name)
+                print(f"  >>: 没有为 {xl_name} 配置描述项，已忽略！ :<<  ")
 
         write_file(delivered_data_packs, out_path, v_set)
-        print(f"  ==========: 生成文件 {out_path} 。")
-
-        input("任务运行完毕。 ")
-
+        success = True
     except AssertionError as asr_err:
         print(f"《《《错误中止》》》： {str(asr_err)}")
     except BaseException as bas_exp:
         print(str(bas_exp))
         print_exc()
 
+    print(f"\n == 总结 == \n任务运行'{"完毕" if success else "中断"}', 共处理 {len(inc_files)} 个文件。"
+          f"{f"，发现未处理{len(exc_files)}个：{str(exc_files)}; " if len(exc_files) else ""}。\n数据未完全归集文件情况：")
+    for fr in inc_files:
+        if fr[-1] != 0:
+            print(f"\t - {fr[0]} 获取 {fr[1]} 行，丢弃{fr[-1]} 行。")
+    input("回车退出。")
